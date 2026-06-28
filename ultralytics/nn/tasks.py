@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
+    AFF,
     AIFI,
     C1,
     C2,
@@ -54,6 +55,7 @@ from ultralytics.nn.modules import (
     HGStem,
     ImagePoolingAttn,
     Index,
+    LFEM,
     LRPCHead,
     Pose,
     Pose26,
@@ -1919,6 +1921,14 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is LFEM:
+            c2 = ch[f]
+            args = [c2]
+        elif m is AFF:
+            if not isinstance(f, list) or len(f) != 2:
+                raise ValueError("AFF expects exactly two input feature maps.")
+            c2 = make_divisible(min(args[0], max_channels) * width, 8)
+            args = [[ch[x] for x in f], c2, *args[1:]]
         elif m in frozenset(
             {
                 Detect,

@@ -94,6 +94,7 @@ from .head import (
     YOLOESegment26,
     v10Detect,
 )
+from .lfem import AFF, LFEM
 from .transformer import (
     AIFI,
     MLP,
@@ -108,6 +109,7 @@ from .transformer import (
 )
 
 __all__ = (
+    "AFF",
     "AIFI",
     "C1",
     "C2",
@@ -163,6 +165,7 @@ __all__ = (
     "LRPCHead",
     "LayerNorm2d",
     "LightConv",
+    "LFEM",
     "MLPBlock",
     "MSDeformAttn",
     "MaxSigmoidAttnBlock",

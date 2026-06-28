@@ -110,10 +110,48 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
+    def __init__(self, reg_max: int = 16, iou_loss: str = "ciou"):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
+        self.iou_loss = iou_loss.lower()
+        if self.iou_loss not in {"ciou", "wiou_v3"}:
+            raise ValueError(f"Unsupported iou_loss='{iou_loss}'. Expected 'ciou' or 'wiou_v3'.")
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.wiou_momentum = 1 - 0.5 ** (1 / 7000)
+        self.register_buffer("wiou_mean", torch.tensor(1.0))
+
+    @staticmethod
+    def _bbox_iou_components(
+        box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return IoU, normalized center distance and enclosing-box diagonal for xyxy boxes."""
+        lt = torch.max(box1[..., :2], box2[..., :2])
+        rb = torch.min(box1[..., 2:], box2[..., 2:])
+        wh = (rb - lt).clamp(min=0)
+        inter = wh[..., 0:1] * wh[..., 1:2]
+
+        wh1 = (box1[..., 2:] - box1[..., :2]).clamp(min=0)
+        wh2 = (box2[..., 2:] - box2[..., :2]).clamp(min=0)
+        union = wh1[..., 0:1] * wh1[..., 1:2] + wh2[..., 0:1] * wh2[..., 1:2] - inter + eps
+        iou = inter / union
+
+        c_wh = torch.max(box1[..., 2:], box2[..., 2:]) - torch.min(box1[..., :2], box2[..., :2])
+        c2 = c_wh[..., 0:1].pow(2) + c_wh[..., 1:2].pow(2) + eps
+        center1 = (box1[..., :2] + box1[..., 2:]) * 0.5
+        center2 = (box2[..., :2] + box2[..., 2:]) * 0.5
+        rho2 = (center2[..., 0:1] - center1[..., 0:1]).pow(2) + (center2[..., 1:2] - center1[..., 1:2]).pow(2)
+        return iou, rho2, c2
+
+    def wise_iou_v3_loss(self, pred_bboxes: torch.Tensor, target_bboxes: torch.Tensor) -> torch.Tensor:
+        """Compute Wise-IoU v3 bbox regression loss for xyxy boxes."""
+        iou, rho2, c2 = self._bbox_iou_components(pred_bboxes, target_bboxes)
+        iou_loss = 1.0 - iou
+        if self.training:
+            self.wiou_mean.mul_(1 - self.wiou_momentum).add_(iou_loss.detach().mean() * self.wiou_momentum)
+        beta = iou_loss.detach() / self.wiou_mean.clamp(min=1e-7)
+        alpha = beta / (3.0 * torch.pow(torch.tensor(1.9, device=beta.device, dtype=beta.dtype), beta - 3.0))
+        distance = torch.exp(rho2 / c2.detach().clamp(min=1e-7))
+        return alpha * distance * iou_loss
 
     def forward(
         self,
@@ -129,8 +167,12 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        if self.iou_loss == "wiou_v3":
+            loss_iou = (self.wise_iou_v3_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask]) * weight).sum()
+            loss_iou /= target_scores_sum
+        else:
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -365,7 +407,7 @@ class v8DetectionLoss:
             stride=self.stride.tolist(),
             topk2=tal_topk2,
         )
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, iou_loss=getattr(h, "iou_loss", "ciou")).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
