@@ -196,6 +196,8 @@ class BaseModel(torch.nn.Module):
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
+                if hasattr(m, "save_attention_map"):
+                    m.save_attention_map(visualize, m.i)
             if m.i in embed:
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
@@ -289,6 +291,141 @@ class BaseModel(torch.nn.Module):
             imgsz (int): The size of the image used for computing model information.
         """
         return model_info(self, detailed=detailed, verbose=verbose, imgsz=imgsz)
+
+    @staticmethod
+    def _activation_memory(x) -> int:
+        """Return tensor activation memory in bytes for tensors, lists, tuples or dictionaries."""
+        if isinstance(x, torch.Tensor):
+            return x.numel() * x.element_size()
+        if isinstance(x, (list, tuple)):
+            return sum(BaseModel._activation_memory(v) for v in x)
+        if isinstance(x, dict):
+            return sum(BaseModel._activation_memory(v) for v in x.values())
+        return 0
+
+    @staticmethod
+    def _clone_profile_input(x):
+        """Clone profile inputs without changing their routing structure."""
+        if isinstance(x, torch.Tensor):
+            return x.clone()
+        if isinstance(x, list):
+            return [BaseModel._clone_profile_input(v) for v in x]
+        if isinstance(x, tuple):
+            return tuple(BaseModel._clone_profile_input(v) for v in x)
+        return x
+
+    def profile(self, imgsz=640, runs: int = 10, baseline=None, verbose: bool = True) -> dict:
+        """Profile LSVD perception modules and whole-model cost.
+
+        Args:
+            imgsz (int | tuple): Input image size used for profiling.
+            runs (int): Number of timed forward runs per layer.
+            baseline (str | Path | bool, optional): Baseline YAML for automatic delta calculation. If ``None`` and the
+                current YAML name contains ``lsvd``, `yolo11.yaml` in the same directory is used when available.
+            verbose (bool): Whether to log a compact profiling table.
+
+        Returns:
+            (dict): Profiling results for LFEM, AFF, total model cost and optional baseline deltas.
+        """
+        try:
+            import thop
+        except ImportError:
+            thop = None
+
+        was_training = self.training
+        self.eval()
+        device = next(self.parameters()).device
+        if isinstance(imgsz, int):
+            imgsz = (imgsz, imgsz)
+        x = torch.zeros(1, self.yaml.get("channels", 3), *imgsz, device=device)
+        y, rows = [], []
+        summary = {
+            "LFEM": {"params": 0, "GFLOPs": 0.0},
+            "AFF": {"params": 0, "GFLOPs": 0.0},
+            "total": {"params": sum(p.numel() for p in self.parameters()), "GFLOPs": 0.0, "memory_MB": 0.0, "time_ms": 0.0},
+        }
+
+        with torch.no_grad():
+            for m in self.model:
+                if m.f != -1:
+                    x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+                params = sum(p.numel() for p in m.parameters())
+                try:
+                    flops = thop.profile(m, inputs=[self._clone_profile_input(x)], verbose=False)[0] / 1e9 * 2 if thop else 0.0
+                except Exception:
+                    flops = 0.0
+
+                elapsed = 0.0
+                out = None
+                for _ in range(max(runs, 1)):
+                    t = time_sync()
+                    out = m(self._clone_profile_input(x))
+                    elapsed += (time_sync() - t) * 1000
+                elapsed /= max(runs, 1)
+                x = out
+                memory = self._activation_memory(x) / 2**20
+                y.append(x if m.i in self.save else None)
+                rows.append((m.i, m.type, params, flops, memory, elapsed))
+                summary["total"]["GFLOPs"] += flops
+                summary["total"]["memory_MB"] += memory
+                summary["total"]["time_ms"] += elapsed
+                if isinstance(m, LFEM):
+                    summary["LFEM"]["params"] += params
+                    summary["LFEM"]["GFLOPs"] += flops
+                elif isinstance(m, AFF):
+                    summary["AFF"]["params"] += params
+                    summary["AFF"]["GFLOPs"] += flops
+
+        if baseline is None:
+            yaml_file = Path(self.yaml.get("yaml_file", ""))
+            candidate = yaml_file.with_name("yolo11.yaml") if "lsvd" in yaml_file.stem else None
+            baseline = candidate if candidate and candidate.exists() else False
+        if baseline:
+            base_model = type(self)(str(baseline), ch=self.yaml.get("channels", 3), nc=self.yaml.get("nc"), verbose=False).to(device)
+            base = base_model.profile(imgsz=imgsz, runs=runs, baseline=False, verbose=False)["total"]
+            summary["delta"] = {
+                "params": summary["total"]["params"] - base["params"],
+                "GFLOPs": summary["total"]["GFLOPs"] - base["GFLOPs"],
+                "memory_MB": summary["total"]["memory_MB"] - base["memory_MB"],
+                "time_ms": summary["total"]["time_ms"] - base["time_ms"],
+            }
+
+        if verbose:
+            LOGGER.info(f"{'LSVD profile':>18} {'params':>12} {'GFLOPs':>10} {'memory':>10} {'time':>10}")
+            LOGGER.info(
+                f"{'LFEM':>18} {summary['LFEM']['params']:12.0f} {summary['LFEM']['GFLOPs']:10.3f}"
+                f" {'-':>10} {'-':>10}"
+            )
+            LOGGER.info(
+                f"{'AFF':>18} {summary['AFF']['params']:12.0f} {summary['AFF']['GFLOPs']:10.3f}"
+                f" {'-':>10} {'-':>10}"
+            )
+            total = summary["total"]
+            LOGGER.info(
+                f"{'total':>18} {total['params']:12.0f} {total['GFLOPs']:10.3f}"
+                f" {total['memory_MB']:9.2f}M {total['time_ms']:9.2f}ms"
+            )
+            if "delta" in summary:
+                delta = summary["delta"]
+                LOGGER.info(
+                    f"{'delta':>18} {delta['params']:12.0f} {delta['GFLOPs']:10.3f}"
+                    f" {delta['memory_MB']:9.2f}M {delta['time_ms']:9.2f}ms"
+                )
+
+        self.train(was_training)
+        return summary
+
+    def save_lsvd_visualizations(self, save_dir: str | Path = Path("runs/detect/lsvd_vis")) -> None:
+        """Save LFEM attention maps and Grad-CAM maps cached during forward/backward.
+
+        Call this method after a training backward pass to export LFEM Grad-CAM. During inference, it also saves the
+        latest LFEM attention response maps.
+        """
+        for m in self.model.modules():
+            if hasattr(m, "save_attention_map"):
+                stage = getattr(m, "i", -1)
+                m.save_attention_map(save_dir, stage)
+                m.save_gradcam(save_dir, stage)
 
     def _apply(self, fn):
         """Apply a function to all tensors in the model, including Detect head attributes like stride and anchors.
